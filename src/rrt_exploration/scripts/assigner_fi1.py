@@ -1,0 +1,366 @@
+#!/usr/bin/env python
+
+#--------Include modules---------------
+from copy import copy
+import rospy
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid
+import tf
+from rrt_exploration.msg import PointArray
+from time import time
+from numpy import array
+from numpy import linalg as LA
+from numpy import all as All
+from numpy import inf
+from functions import robot,informationGain,discount
+from numpy.linalg import norm
+
+# Subscribers' callbacks------------------------------
+mapData=OccupancyGrid()
+frontiers=[]
+global1=OccupancyGrid()
+global2=OccupancyGrid()
+global3=OccupancyGrid()
+globalmaps=[]
+stored_frontiers = []
+last_exploration_point = None
+
+def callBack(data):
+    global frontiers
+    frontiers=[]
+    for point in data.points:
+        frontiers.append(array([point.x,point.y]))
+
+def mapCallBack(data):
+    global mapData
+    mapData=data
+
+# Node----------------------------------------------
+def node():
+    global frontiers,mapData,global1,global2,global3,globalmaps,stored_frontiers,last_exploration_point
+    rospy.init_node('assigner_test', anonymous=False)
+    
+    # fetching all parameters
+    map_topic= rospy.get_param('~map_topic','/map')
+    info_radius= rospy.get_param('~info_radius',1.0)
+    info_multiplier=rospy.get_param('~info_multiplier',3.0)        
+    hysteresis_radius=rospy.get_param('~hysteresis_radius',3.0)
+    hysteresis_gain=rospy.get_param('~hysteresis_gain',2.0)
+    frontiers_topic= rospy.get_param('~frontiers_topic','/filtered_points')    
+    n_robots = rospy.get_param('~n_robots',1)
+    namespace = rospy.get_param('~namespace','')
+    namespace_init_count = rospy.get_param('namespace_init_count',1)
+    delay_after_assignement=rospy.get_param('~delay_after_assignement',0.5)
+    rateHz = rospy.get_param('~rate',100)
+    
+    # Battery and charging parameters
+    drain_rate = 0.1
+    min_battery = 90
+    battery_level = 100
+    charging_time = 5.0  # 5 seconds for charging
+    # Define multiple charging stations
+    charging_stations = [
+        array([-1.756932, -1.756932]),  # Original station
+        array([1.5, 1.5]),              # New station 1
+        array([-1.5, 1.5]),             # New station 2
+        array([1.5, -1.5])              # New station 3
+    ]
+    is_charging = False
+    charge_start_time = None
+    
+    rate = rospy.Rate(rateHz)
+    
+    rospy.Subscriber(map_topic, OccupancyGrid, mapCallBack)
+    rospy.Subscriber(frontiers_topic, PointArray, callBack)
+    
+    while len(frontiers)<1:
+        pass
+    centroids=copy(frontiers)    
+    
+    while (len(mapData.data)<1):
+        pass
+
+    robots=[]
+    if len(namespace)>0:
+        for i in range(0,n_robots):
+            robots.append(robot(namespace+str(i+namespace_init_count)))
+    elif len(namespace)==0:
+            robots.append(robot(namespace))
+    
+    for i in range(0,n_robots):
+        robots[i].sendGoal(robots[i].getPosition())
+
+    last_time = time()
+    
+    while not rospy.is_shutdown():
+        # Battery simulation
+        current_time = time()
+        elapsed_time = current_time - last_time
+        last_time = current_time
+        
+        if not is_charging:
+            battery_level -= drain_rate * elapsed_time
+        
+        for i in range(n_robots):
+            current_pose = robots[i].getPosition()
+            rospy.loginfo("-----------------------------")
+            rospy.loginfo("Position: [%.2f, %.2f]" % (current_pose[0], current_pose[1]))
+            rospy.loginfo("-----------------------------")
+        
+        rospy.loginfo("Battery Level: %.1f%%" % battery_level)
+        
+        # Check if need to charge
+        if battery_level <= min_battery and not is_charging:
+            rospy.loginfo("Low battery! Storing current exploration state")
+            stored_frontiers = copy(frontiers)
+            for i in range(n_robots):
+                if robots[i].assigned_point is not None:
+                    last_exploration_point = copy(robots[i].assigned_point)
+                    rospy.loginfo("Stored last exploration point from assigned point: %s" % str(last_exploration_point))
+                else:
+                    last_exploration_point = copy(robots[i].getPosition())
+                    rospy.loginfo("Stored last exploration point from current position: %s" % str(last_exploration_point))
+            
+            # Find nearest charging station for each robot
+            for i in range(n_robots):
+                robot_pos = robots[i].getPosition()
+                if robot_pos is None:
+                    rospy.logwarn("Could not get position for robot %d" % i)
+                    continue
+                
+                # Calculate distances to all charging stations
+                distances = [norm(robot_pos - station) for station in charging_stations]
+                
+                # Print distances to all charging stations
+                rospy.loginfo("Robot %d distances to charging stations:" % i)
+                for station_idx, distance in enumerate(distances):
+                    rospy.loginfo("Station %d at %s: %.2f meters" % 
+                                (station_idx, str(charging_stations[station_idx]), distance))
+                
+                # Find the nearest station
+                nearest_station_idx = distances.index(min(distances))
+                nearest_station = charging_stations[nearest_station_idx]
+                
+                rospy.loginfo("Robot %d moving to nearest charging station %d at %s (distance: %.2f meters)" % 
+                             (i, nearest_station_idx, str(nearest_station), min(distances)))
+                
+                # Initial goal sending
+                robots[i].sendGoal(nearest_station)
+                last_distance = float('inf')
+                stuck_counter = 0
+                
+                # Keep monitoring until we actually reach the station
+                while not rospy.is_shutdown():
+                    current_pos = robots[i].getPosition()
+                    if current_pos is None:
+                        rospy.logwarn("Lost position data for robot %d" % i)
+                        rospy.sleep(0.2)
+                        continue
+                    
+                    distance_to_station = norm(current_pos - nearest_station)
+                    rospy.loginfo("Robot %d - Distance to station: %.2f, Current pos: %s, Target: %s" % 
+                                 (i, distance_to_station, str(current_pos), str(nearest_station)))
+                    
+                    # Check if we've reached the station
+                    if distance_to_station <= 0.5:
+                        rospy.loginfo("Robot %d reached charging station!" % i)
+                        is_charging = True
+                        charge_start_time = time()
+                        rospy.loginfo("Started charging at station %d" % nearest_station_idx)
+                        break
+                    
+                    # Check if we're making progress
+                    if abs(distance_to_station - last_distance) < 0.01:
+                        stuck_counter += 1
+                    else:
+                        stuck_counter = 0
+                    
+                    # If stuck or not moving, resend goal
+                    if stuck_counter > 10 or robots[i].getState() != 1:
+                        rospy.loginfo("Resending goal for robot %d" % i)
+                        robots[i].sendGoal(nearest_station)
+                        stuck_counter = 0
+                    
+                    last_distance = distance_to_station
+                    rospy.sleep(0.2)  # Small sleep to prevent CPU overload
+                
+                if is_charging:
+                    rospy.loginfo("Successfully started charging")
+                    break  # Exit the robot loop once charging starts
+                else:
+                    rospy.logwarn("Continuing to try reaching charging station...")
+                    continue  # Keep trying with the same robot
+            
+            if not is_charging:
+                rospy.logwarn("Failed to reach any charging station, will retry...")
+                continue  # Go back to the start of the main loop
+            
+            continue  # Continue with the main loop while charging
+
+        # Check if currently charging
+        if is_charging:
+            if time() - charge_start_time >= charging_time:
+                is_charging = False
+                battery_level = 100  # Full charge
+                rospy.loginfo("Charging complete! Battery at 100%")
+                
+                # Resume exploration with fresh frontier detection
+                rospy.loginfo("Generating new frontiers for exploration...")
+                if len(frontiers) > 0:
+                    centroids = copy(frontiers)
+                    
+                    # Reset robots for new assignments
+                    for i in range(n_robots):
+                        robots[i].assigned_point = None
+                    
+                    # Get all available robots
+                    na = []  # available robots
+                    nb = []  # busy robots
+                    for i in range(0, n_robots):
+                        if (robots[i].getState() == 1):
+                            nb.append(i)
+                        else:
+                            na.append(i)
+                    rospy.loginfo("Available robots: " + str(na))
+                    
+                    # Calculate info gain for all possible frontiers
+                    infoGain = []
+                    valid_centroids = []
+                    
+                    # Generate more potential frontiers by sampling around existing ones
+                    expanded_centroids = []
+                    for c in centroids:
+                        expanded_centroids.append(c)  # Original centroid
+                        # Generate additional points around each frontier
+                        for offset_x in [-1.0, 0, 1.0]:
+                            for offset_y in [-1.0, 0, 1.0]:
+                                if offset_x == 0 and offset_y == 0:
+                                    continue
+                                new_point = array([c[0] + offset_x, c[1] + offset_y])
+                                expanded_centroids.append(new_point)
+                    
+                    # Filter and evaluate all potential frontiers
+                    for point in expanded_centroids:
+                        info_gain = informationGain(mapData, [point[0], point[1]], info_radius)
+                        if info_gain > 0.2:  # Only consider points with significant information gain
+                            infoGain.append(info_gain)
+                            valid_centroids.append(point)
+                    
+                    rospy.loginfo("Generated %d potential frontier points" % len(valid_centroids))
+                    
+                    if len(valid_centroids) > 0:
+                        revenue_record = []
+                        centroid_record = []
+                        id_record = []
+                        
+                        # Calculate revenues for new frontiers
+                        for ir in na:
+                            current_pos = robots[ir].getPosition()
+                            if current_pos is not None:
+                                for ip in range(len(valid_centroids)):
+                                    cost = norm(current_pos - valid_centroids[ip])
+                                    information_gain = infoGain[ip]
+                                    
+                                    # Prioritize points farther from current position
+                                    if cost > hysteresis_radius:
+                                        information_gain *= 1.5  # Boost far points
+                                    
+                                    revenue = information_gain * info_multiplier - cost
+                                    revenue_record.append(revenue)
+                                    centroid_record.append(valid_centroids[ip])
+                                    id_record.append(ir)
+                        
+                        # Assign best frontier
+                        if len(revenue_record) > 0:
+                            winner_id = revenue_record.index(max(revenue_record))
+                            target_point = centroid_record[winner_id]
+                            
+                            robots[id_record[winner_id]].sendGoal(target_point)
+                            robots[id_record[winner_id]].assigned_point = target_point
+                            rospy.loginfo("Robot %d assigned to new frontier at %s (revenue: %.2f)" % 
+                                        (id_record[winner_id], str(target_point), revenue_record[winner_id]))
+                            rospy.sleep(delay_after_assignement)
+                    
+                    # Clear old frontiers to force new detection
+                    stored_frontiers = []
+                    last_exploration_point = None
+                
+            else:
+                rospy.loginfo("Charging... %.1f seconds remaining" % 
+                            (charging_time - (time() - charge_start_time)))
+            rate.sleep()
+            continue
+        
+        # Normal exploration code
+        centroids = copy(frontiers)
+        
+        if len(centroids) > 0:
+            rospy.loginfo("Number of frontiers available: %d" % len(centroids))
+            infoGain = []
+            for ip in range(0, len(centroids)):
+                infoGain.append(informationGain(mapData, [centroids[ip][0], centroids[ip][1]], info_radius))
+        
+        na=[]
+        nb=[]
+        for i in range(0,n_robots):
+            if (robots[i].getState()==1):
+                nb.append(i)
+            else:
+                na.append(i)    
+        rospy.loginfo("available robots: "+str(na))    
+        
+        for i in nb+na:
+            if robots[i].assigned_point is not None:
+                infoGain = discount(mapData, robots[i].assigned_point, centroids, infoGain, info_radius)
+            
+        revenue_record=[]
+        centroid_record=[]
+        id_record=[]
+        
+        for ir in na:
+            for ip in range(0,len(centroids)):
+                cost=norm(robots[ir].getPosition()-centroids[ip])        
+                threshold=1
+                information_gain=infoGain[ip]
+                if (norm(robots[ir].getPosition()-centroids[ip])<=hysteresis_radius):
+                    information_gain*=hysteresis_gain
+                
+                revenue=information_gain*info_multiplier-cost
+                revenue_record.append(revenue)
+                centroid_record.append(centroids[ip])
+                id_record.append(ir)
+        
+        if len(na)<1:
+            revenue_record=[]
+            centroid_record=[]
+            id_record=[]
+            for ir in nb:
+                for ip in range(0,len(centroids)):
+                    cost=norm(robots[ir].getPosition()-centroids[ip])        
+                    threshold=1
+                    information_gain=infoGain[ip]
+                    if (norm(robots[ir].getPosition()-centroids[ip])<=hysteresis_radius):
+                        information_gain*=hysteresis_gain
+                    
+                    if ((norm(centroids[ip]-robots[ir].assigned_point))<hysteresis_radius):
+                        information_gain=informationGain(mapData,[centroids[ip][0],centroids[ip][1]],info_radius)*hysteresis_gain
+
+                    revenue=information_gain*info_multiplier-cost
+                    revenue_record.append(revenue)
+                    centroid_record.append(centroids[ip])
+                    id_record.append(ir)
+        
+        if (len(id_record)>0):
+            winner_id=revenue_record.index(max(revenue_record))
+            robots[id_record[winner_id]].sendGoal(centroid_record[winner_id])
+            rospy.loginfo(namespace+str(namespace_init_count+id_record[winner_id])+"  assigned to  "+str(centroid_record[winner_id]))    
+            rospy.sleep(delay_after_assignement)
+            
+        rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        node()
+    except rospy.ROSInterruptException:
+        pass
